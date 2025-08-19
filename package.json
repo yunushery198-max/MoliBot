@@ -1,0 +1,26 @@
+{
+  "name": "moli-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@google/generative-ai": "^0.24.1",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "fs-extra": "^11.3.1",
+    "nanoid": "^5.1.5",
+    "node-cron": "^4.2.1",
+    "node-fetch": "^3.3.2",
+    "pino": "^9.9.0",
+    "qrcode-terminal": "^0.12.0",
+    "yt-search": "^2.13.1",
+    "ytdl-core": "^4.11.5",
+    "ytsr": "^3.8.4"
+  }
+}

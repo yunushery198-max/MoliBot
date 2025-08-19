@@ -1,0 +1,532 @@
+// ================== bot.js (ESM) ==================
+import pkg from '@whiskeysockets/baileys';
+const {
+default: makeWASocket,
+useMultiFileAuthState,
+fetchLatestBaileysVersion,
+DisconnectReason,
+jidNormalizedUser
+} = pkg;
+
+import qrcode from 'qrcode-terminal';
+import fetch from 'node-fetch';
+import fs from 'fs';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+// ===== ENV =====
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
+
+// ===== Admin & state =====
+const ADMINS_DEFAULT = new Set(['62816267763']); // admin default
+const admins = new Set([...ADMINS_DEFAULT]);
+const blockedUsers = new Set();
+const cooldown = new Map(); // per-user 10s
+const groupSet = new Set(); // grup yang terdeteksi
+let lastPromoAt = 0; // promo 1 jam sekali/grup
+
+// ===== Antrian (VN) =====
+const voiceQueue = []; // item: {type:'voice'|'nyanyi'|'music', from, sender, prompt, m}
+let processingVoice = false;
+
+// ===== Utilities =====
+const wait = (ms)=>new Promise(r=>setTimeout(r, ms));
+const now = ()=>Date.now();
+
+function normalizeJidNumber(input) {
+const num = (input||'').replace(/[^0-9]/g, '');
+if (!num) return null;
+if (num.startsWith('0')) return `62${num.slice(1)}@s.whatsapp.net`;
+if (num.startsWith('62')) return `${num}@s.whatsapp.net`;
+if (num.startsWith('8')) return `62${num}@s.whatsapp.net`;
+if (num.startsWith('628')) return `${num}@s.whatsapp.net`;
+return `${num}@s.whatsapp.net`;
+}
+
+function mentionTag(jid) {
+try { return `@${(jid||'').split('@')[0]}` } catch { return '@user' }
+}
+
+function randomPick(arr){ return arr[Math.floor(Math.random()*arr.length)] }
+
+// respon pembuka (sebelum proses)
+const preText = [
+(u)=>`Oke ${mentionTag(u)} 🤔, aku cek dulu ya...`,
+(u)=>`Siap ${mentionTag(u)} 😎, proses bentar...`,
+(u)=>`Santuy ${mentionTag(u)} 😉, aku urus dulu...`,
+(u)=>`Diterima ${mentionTag(u)} 😋, tunggu sebentar...`
+];
+
+// respon khusus voice/nyanyi/music
+const preVoice = [
+(u)=>`🎤 ${mentionTag(u)} siap, aku rekam dulu ya...`,
+(u)=>`🔊 ${mentionTag(u)} bentar, lagi atur mic...`,
+(u)=>`🎙️ ${mentionTag(u)} oke, suara jalan nih...`
+];
+const preSing = [
+(u)=>`🎵 ${mentionTag(u)} gas, aku bacain liriknya...`,
+(u)=>`🎶 ${mentionTag(u)} siap, part nyanyi dimulai...`,
+(u)=>`🎼 ${mentionTag(u)} oke, aku nyanyiin versi singkat...`
+];
+const preMusic = [
+(u)=>`🎧 ${mentionTag(u)} siap, putar musik VN...`,
+(u)=>`🎼 ${mentionTag(u)} oke, musik on the way...`,
+(u)=>`🎵 ${mentionTag(u)} bentar, lagi komponin nadanya...`
+];
+
+// respon selesai
+const afterDone = [
+(u)=>`Selesai untuk ${mentionTag(u)} ✅`,
+(u)=>`Done! ${mentionTag(u)} ✅`,
+(u)=>`Udah terkirim ya ${mentionTag(u)} ✅`
+];
+
+// ===== Cooldown 10 detik =====
+function isOnCooldown(userJid) {
+const last = cooldown.get(userJid) || 0;
+if (now() - last < 10000) return true;
+cooldown.set(userJid, now());
+return false;
+}
+
+// ===== Promo 1 jam sekali (grup) =====
+function shouldPromo(groupJid) {
+if (!groupJid.endsWith('@g.us')) return false;
+const t = now();
+if (t - lastPromoAt > 3600_000) { // 1 jam
+lastPromoAt = t;
+return true;
+}
+return false;
+}
+function promoText() {
+return `✨ *Promo WaBot-Kamu* ✨
+• AI teks pintar, VN suara & "nyanyi" lirik
+• Panggil user otomatis
+• Anti spam + blokir
+• Admin bisa atur whitelist, dll.
+
+Minat custom? Chat: wa.me/62816267763`;
+}
+
+// ===== Auto-delete file 10 menit =====
+function scheduleAutoDelete(path) {
+setTimeout(()=> {
+try { if (fs.existsSync(path)) fs.unlinkSync(path) } catch {}
+}, 600_000);
+}
+
+// ===== Gemini (text) =====
+async function aiText(prompt) {
+// Google Generative AI SDK ESM
+const { GoogleGenerativeAI } = await import('@google/generative-ai');
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const res = await model.generateContent(prompt);
+return res.response.text();
+}
+
+// ===== ElevenLabs TTS (maks ~120 detik ~ 1500 char) =====
+async function elevenTTS(text) {
+const maxChars = 1500;
+const finalText = (text||'').slice(0, maxChars);
+const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+const resp = await fetch(url, {
+method: 'POST',
+headers: {
+'xi-api-key': ELEVEN_API_KEY,
+'Content-Type': 'application/json'
+},
+body: JSON.stringify({
+text: finalText,
+model_id: 'eleven_multilingual_v2',
+voice_settings: { stability: 0.5, similarity_boost: 0.5 }
+})
+});
+if (!resp.ok) throw new Error('TTS gagal (ElevenLabs).');
+const buf = Buffer.from(await resp.arrayBuffer());
+const file = `./tts_${Date.now()}.mp3`;
+fs.writeFileSync(file, buf);
+scheduleAutoDelete(file);
+return file;
+}
+
+// ====== Proses antrian VN (voice/nyanyi/music) ======
+async function processVoiceQueue(sock) {
+if (processingVoice) return;
+processingVoice = true;
+try {
+while (voiceQueue.length > 0) {
+const job = voiceQueue.shift();
+const { from, sender, type, prompt, m } = job;
+
+// proses AI (untuk voice & nyanyi & music)
+let aiOut = '';
+try {
+if (type === 'nyanyi') {
+// minta lirik/kalimat pendek
+aiOut = await aiText(
+`Buat jawaban singkat seperti potongan lirik atau 1-2 kalimat saja tentang: ${prompt}`
+);
+} else if (type === 'music') {
+// simulasi "lagu" via TTS
+aiOut = await aiText(
+`Buat potongan bait sederhana bertema: ${prompt}. Maks 2 kalimat.`
+);
+} else {
+aiOut = await aiText(prompt);
+}
+} catch (e) {
+aiOut = 'Maaf, AI sedang padat. Coba lagi nanti ya.';
+}
+
+// bikin VN
+let filePath = null;
+try {
+filePath = await elevenTTS(type==='nyanyi' ? ('🎵 '+aiOut) : aiOut);
+} catch (e) {
+await sock.sendMessage(from, {
+text: `${mentionTag(sender)} maaf, TTS lagi error.`, mentions: [sender], quoted: m
+});
+continue;
+}
+
+// kirim VN + mention pesan sebelumnya
+const audio = fs.readFileSync(filePath);
+await sock.sendMessage(from, {
+audio,
+mimetype: 'audio/mpeg',
+ptt: true,
+mentions: [sender],
+quoted: m
+});
+
+// info selesai
+await sock.sendMessage(from, {
+text: randomPick(afterDone)(sender),
+mentions: [sender],
+quoted: m
+});
+
+// beritahu semua yang masih dalam antrian bahwa slot sudah longgar
+if (voiceQueue.length > 0) {
+const uniqWaiting = [...new Set(voiceQueue.map(j => j.sender))];
+await sock.sendMessage(from, {
+text: `✅ Antrian longgar. Giliran berikutnya: ${uniqWaiting.map(mentionTag).join(' ')}`,
+mentions: uniqWaiting,
+quoted: m
+});
+}
+// jeda kecil antar pekerjaan biar aman
+await wait(1200);
+}
+} finally {
+processingVoice = false;
+}
+}
+
+// ====== Bot start ======
+async function startBot(){
+const { state, saveCreds } = await useMultiFileAuthState('auth');
+const { version } = await fetchLatestBaileysVersion();
+const sock = makeWASocket({
+version,
+auth: state,
+printQRInTerminal: false,
+browser: ['Ubuntu','Chrome','22.04.4']
+});
+
+sock.ev.on('creds.update', saveCreds);
+
+sock.ev.on('connection.update', ({ connection, lastDisconnect, qr })=>{
+if (qr) {
+console.log('📌 Scan QR untuk login:');
+qrcode.generate(qr, { small: true });
+}
+if (connection === 'close') {
+const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+console.log('❌ Koneksi putus. Reconnect:', shouldReconnect);
+if (shouldReconnect) startBot();
+} else if (connection === 'open') {
+console.log('✅ Bot tersambung.');
+}
+});
+
+// ======= Auto-post jadwal sholat sederhana (placeholder WIB & WITA) =======
+// Catatan: ini pengingat jam tetap (bukan perhitungan astronomi).
+// WIB: 04:45, 12:00, 15:15, 18:00, 19:10
+// WITA: +1 jam dari WIB
+setInterval(async ()=>{
+const d = new Date();
+const hh = d.getHours().toString().padStart(2,'0');
+const mm = d.getMinutes().toString().padStart(2,'0');
+const time = `${hh}:${mm}`;
+
+const broadcastTimesWIB = new Set(['04:45','12:00','15:15','18:00','19:10']);
+const broadcastTimesWITA = new Set(['05:45','13:00','16:15','19:00','20:10']);
+
+if (broadcastTimesWIB.has(time) || broadcastTimesWITA.has(time)) {
+for (const gid of groupSet) {
+try {
+await sock.sendMessage(gid, { text:
+`🕌 *Pengingat Sholat*
+WIB: Subuh 04:45 • Dzuhur 12:00 • Ashar 15:15 • Maghrib 18:00 • Isya 19:10
+WITA: Subuh 05:45 • Dzuhur 13:00 • Ashar 16:15 • Maghrib 19:00 • Isya 20:10`
+});
+await wait(500);
+} catch {}
+}
+}
+}, 60_000); // cek tiap menit
+
+// ======= Pesan masuk =======
+sock.ev.on('messages.upsert', async ({ messages })=>{
+const m = messages[0];
+if (!m?.message || !m.key?.remoteJid) return;
+
+const from = m.key.remoteJid;
+const sender = m.key.participant || m.key.remoteJid;
+const isGroup = from.endsWith('@g.us');
+if (isGroup) groupSet.add(from);
+if (blockedUsers.has(sender)) return;
+
+const text =
+m.message.conversation ||
+m.message.extendedTextMessage?.text ||
+m.message.imageMessage?.caption ||
+m.message.videoMessage?.caption ||
+'';
+
+if (!text) return;
+const lower = text.toLowerCase();
+
+// PROMO: tampilkan 1 jam sekali di grup
+if (isGroup && shouldPromo(from)) {
+await sock.sendMessage(from, { text: promoText() }).catch(()=>{});
+}
+
+// Anti-spam (10 detik untuk semua perintah)
+const isCommand = lower.includes('moli');
+if (isCommand && isOnCooldown(sender)) {
+// kirim privat & blokir
+try {
+await sock.sendMessage(sender, { text: randomPick([
+'Jangan spam ya, tunggu 10 detik dulu.',
+'Sabar dikit dong—cooldown 10 detik biar aman.',
+'Wah cepet banget! Jeda 10 detik ya ✋'
+])});
+blockedUsers.add(sender);
+await sock.sendMessage(sender, { text: 'Maaf saya blok anda, untuk membuka blok anda ss pesan ini ke 0816267763' });
+} catch {}
+return;
+}
+
+// ====== "moli menu" => kirim menu via private chat, bukan di grup ======
+if (lower.includes('moli menu')) {
+const menuText =
+`📌 *Daftar Perintah WaBot-Kamu* 📌
+
+• Teks AI: ketik "... bot ... (pertanyaan)"
+• Suara AI: ketik "... bot suara ... (teks)"
+• "Nyanyi": ketik "... bot nyanyi ... (judul/tema)"
+• Musik VN: ketik "... bot play music ... (judul/tema)"
+• Panggil: "bot panggil @user [pesan opsional]"
+• Admin: "bot tambah admin 62xxxxxxxxxx"
+• Blokir: "bot blokir @user"
+• Unblokir: "bot buka blokir @user"
+
+Catatan:
+- Akses tiap 10 detik/user.
+- Perintah VN (suara/nyanyi/music) pakai antrian; setelah terkirim, semua di antrian diberi tahu slot bebas.`;
+// kirim ke PC
+await sock.sendMessage(sender, { text: menuText }).catch(()=>{});
+// kasih notif singkat di grup (tanpa kata "moli")
+if (isGroup) {
+await sock.sendMessage(from, {
+text: `${mentionTag(sender)} menu sudah dikirim ke chat pribadi ✅`,
+mentions: [sender],
+quoted: m
+}).catch(()=>{});
+}
+return;
+}
+
+// ====== Parsers Command ======
+const voiceCmd =
+(lower.includes('suara') || lower.includes('bersuara') || lower.includes('suaranya')) &&
+lower.includes('moli');
+
+const singCmd =
+(lower.includes('nyanyi') || lower.includes('bernyanyi') || lower.includes('nyanyikan')) &&
+lower.includes('moli');
+
+const musicCmd = lower.includes('moli') && lower.includes('play music');
+
+const textCmd =
+lower.includes('moli') &&
+!voiceCmd && !singCmd && !musicCmd;
+
+const callUserCmd = lower.startsWith('moli panggil');
+
+const addAdminCmd = lower.startsWith('moli tambah admin');
+const blockCmd = lower.startsWith('moli blokir');
+const unBlockCmd = lower.startsWith('moli buka blokir');
+
+// ====== Admin helpers ======
+const senderNum = (sender||'').split('@')[0];
+const isAdmin = admins.has(senderNum);
+
+// ====== TEXT AI ======
+if (textCmd) {
+await sock.sendMessage(from, {
+text: randomPick(preText)(sender),
+mentions: [sender],
+quoted: m
+});
+
+const prompt = text.replace(/moli/gi, '').trim() || 'Halo!';
+let answer = '';
+try {
+answer = await aiText(prompt);
+} catch {
+answer = 'Maaf, AI sedang sibuk. Coba lagi, ya.';
+}
+
+await sock.sendMessage(from, {
+text: `${mentionTag(sender)}\n${answer}`,
+mentions: [sender],
+quoted: m
+});
+return;
+}
+
+// ====== VOICE AI ======
+if (voiceCmd) {
+const prompt = text.replace(/moli/gi, '').replace(/suara|bersuara|suaranya/gi,'').trim();
+if (!prompt) return;
+
+// respon pembuka
+await sock.sendMessage(from, {
+text: randomPick(preVoice)(sender),
+mentions: [sender],
+quoted: m
+});
+
+// masuk antrian
+voiceQueue.push({ type: 'voice', from, sender, prompt, m });
+processVoiceQueue(sock);
+return;
+}
+
+// ====== "NYANYI" AI ======
+if (singCmd) {
+const prompt = text.replace(/moli/gi, '').replace(/nyanyi|bernyanyi|nyanyikan/gi,'').trim();
+if (!prompt) return;
+
+await sock.sendMessage(from, {
+text: randomPick(preSing)(sender),
+mentions: [sender],
+quoted: m
+});
+
+voiceQueue.push({ type: 'nyanyi', from, sender, prompt, m });
+processVoiceQueue(sock);
+return;
+}
+
+// ====== PLAY MUSIC (VN simulasi) ======
+if (musicCmd) {
+const prompt = text.replace(/moli/gi, '').replace(/play music/gi,'').trim() || 'musik santai';
+await sock.sendMessage(from, {
+text: randomPick(preMusic)(sender),
+mentions: [sender],
+quoted: m
+});
+
+voiceQueue.push({ type: 'music', from, sender, prompt, m });
+processVoiceQueue(sock);
+return;
+}
+
+// ====== PANGGIL USER ======
+if (callUserCmd) {
+// ambil mention dari pesan
+const ctxMentions = m.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+const tokens = text.split(' ');
+// pesan opsional setelah mention/nomor
+const extraMsg = text.slice('moli panggil'.length).trim();
+
+if (ctxMentions.length === 0) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} sebut @user yang mau dipanggil ya.`, mentions:[sender], quoted:m });
+return;
+}
+
+for (const target of ctxMentions) {
+// PC ke target
+try {
+await sock.sendMessage(target, { text:
+`👋 Hai ${mentionTag(target)}, kamu dipanggil di grup:\n"${extraMsg || 'cek grup, ada yang manggil kamu'}"`}
+);
+} catch {}
+// mention di grup
+await sock.sendMessage(from, { text:
+`${mentionTag(target)} dipanggil oleh ${mentionTag(sender)}.`, mentions:[target, sender], quoted:m
+});
+}
+return;
+}
+
+// ====== ADMIN: tambah admin ======
+if (addAdminCmd) {
+if (!isAdmin) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} perintah khusus admin.`, mentions:[sender], quoted:m });
+return;
+}
+const num = (text.split(' ').pop() || '').replace(/[^0-9]/g, '');
+if (!num) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} sertakan nomor. Contoh: moli tambah admin 62812xxxx`, mentions:[sender], quoted:m });
+return;
+}
+admins.add(num);
+await sock.sendMessage(from, { text: `✅ ${num} ditambahkan sebagai admin.` });
+return;
+}
+
+// ====== ADMIN: blokir ======
+if (blockCmd) {
+if (!isAdmin) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} perintah khusus admin.`, mentions:[sender], quoted:m });
+return;
+}
+const targets = m.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+if (targets.length === 0) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} tag user yang akan diblokir.`, mentions:[sender], quoted:m });
+return;
+}
+for (const t of targets) blockedUsers.add(t);
+await sock.sendMessage(from, { text: `🚫 Diblokir: ${targets.map(mentionTag).join(' ')}`, mentions: targets, quoted:m });
+return;
+}
+
+// ====== ADMIN: buka blokir ======
+if (unBlockCmd) {
+if (!isAdmin) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} perintah khusus admin.`, mentions:[sender], quoted:m });
+return;
+}
+const targets = m.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+if (targets.length === 0) {
+await sock.sendMessage(from, { text: `${mentionTag(sender)} tag user yang mau dibuka blokirnya.`, mentions:[sender], quoted:m });
+return;
+}
+for (const t of targets) blockedUsers.delete(t);
+await sock.sendMessage(from, { text: `✅ Dibuka blokir: ${targets.map(mentionTag).join(' ')}`, mentions: targets, quoted:m });
+return;
+}
+});
+}
+
+startBot();

@@ -1,0 +1,94 @@
+import baileys from '@whiskeysockets/baileys'
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys'
+
+import { GoogleGenerativeAI } from "@google/generative-ai";
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Fungsi AI
+async function askGemini(prompt) {
+try {
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" })
+const result = await model.generateContent(prompt)
+return result.response.text()
+} catch (err) {
+if (err?.response?.data?.error?.details) {
+let retry = err.response.data.error.details.find(d => d['@type']?.includes('RetryInfo'))
+if (retry?.retryDelay) {
+let waitTime = retry.retryDelay.replace('s', ' detik')
+return `aku lagi istirahat, coba lagi nanti dalam ${waitTime} 💤`
+}
+}
+console.error("Gemini error:", err)
+return "aku lagi bingung... coba lagi nanti ya 😅"
+}
+}
+
+// Fungsi text → suara (contoh pakai file dummy, ganti dengan TTS API mu)
+async function textToSpeech(text) {
+const filename = './voice.mp3'
+fs.writeFileSync(filename, "FAKE_VOICE_" + text) // ganti dengan API TTS asli
+return filename
+}
+
+// Fungsi text → nyanyi (sama seperti TTS, dummy dulu)
+async function textToSing(text) {
+const filename = './song.mp3'
+fs.writeFileSync(filename, "FAKE_SONG_" + text) // ganti dengan API Music AI kalau ada
+return filename
+}
+
+// Start bot
+async function startBot() {
+const { state, saveCreds } = await useMultiFileAuthState('session')
+const { version } = await fetchLatestBaileysVersion()
+
+const sock = makeWASocket({
+version,
+auth: state,
+printQRInTerminal: true
+})
+
+sock.ev.on('creds.update', saveCreds)
+
+sock.ev.on('messages.upsert', async ({ messages }) => {
+const m = messages[0]
+if (!m.message) return
+const from = m.key.remoteJid
+const textMsg = m.message.conversation || m.message.extendedTextMessage?.text || ""
+
+// Kalau ada kata "moli" atau "suara"/"nyanyi" dalam teks
+if (/moli|suara|nyanyi/i.test(textMsg)) {
+let reply = ""
+
+// Balas dulu "Tunggu sebentar..."
+await sock.sendMessage(from, {
+text: `Tunggu sebentara yaaaa moli siap2 dulu ...!`,
+mentions: [m.key.participant || m.key.remoteJid]
+}, { quoted: m })
+
+// Perintah suara
+if (/moli.*suara|suara.*moli|bersuara|suaranya/i.test(textMsg)) {
+const aiText = await askGemini(textMsg)
+const voiceFile = await textToSpeech(aiText)
+reply = { audio: { url: voiceFile }, mimetype: 'audio/mp4', ptt: true }
+}
+// Perintah nyanyi
+else if (/moli.*nyanyi|nyanyi.*moli|bernyanyi|nyanyikan/i.test(textMsg)) {
+const aiText = await askGemini(textMsg)
+const songFile = await textToSing(aiText)
+reply = { audio: { url: songFile }, mimetype: 'audio/mp4', ptt: true }
+}
+// Default → text AI
+else if (/moli/i.test(textMsg)) {
+const aiText = await askGemini(textMsg)
+reply = { text: aiText, mentions: [m.key.participant || m.key.remoteJid] }
+}
+
+if (reply) {
+await sock.sendMessage(from, reply, { quoted: m })
+}
+}
+})
+}
+
+startBot()

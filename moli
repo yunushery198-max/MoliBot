@@ -1,0 +1,186 @@
+import { makeWASocket,
+DisconnectReason,
+fetchLatestBaileysVersion,
+useMultiFileAuthState
+} from "@whiskeysockets/baileys"
+import qrcode from "qrcode-terminal"
+import fetch from "node-fetch"
+import { GoogleGenerativeAI } from "@google/generative-ai"
+import fs from "fs"
+
+
+// ===== API KEYS =====
+const GEMINI_API_KEY = "AIzaSyBbAm_P00dnbtKQm6692Z1w1ymqjvdHSS0"
+const ELEVEN_API_KEY = "sk_89232d9094e3036b6db5437fba8f0bbf9c929117e589ccce"
+const ELEVEN_VOICE_ID = "I7sakys8pBZ1Z5f0UhT9"
+
+// Gemini setup
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY)
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" })
+
+// ElevenLabs TTS (max 120 detik ~ kira2 1500 karakter)
+async function textToSpeech(text) {
+const maxChars = 1500
+let finalText = text.slice(0, maxChars)
+
+const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`
+const response = await fetch(url, {
+method: "POST",
+headers: {
+"Content-Type": "application/json",
+"xi-api-key": ELEVEN_API_KEY
+},
+body: JSON.stringify({
+text: finalText,
+model_id: "eleven_multilingual_v2",
+voice_settings: { stability: 0.5, similarity_boost: 0.5 }
+})
+})
+
+if (!response.ok) throw new Error("Gagal request ke ElevenLabs")
+
+const buffer = Buffer.from(await response.arrayBuffer())
+const filePath = "./tts.mp3"
+fs.writeFileSync(filePath, buffer)
+return filePath
+}
+
+// ===== BOT START =====
+async function startBot() {
+const { state, saveCreds } = await useMultiFileAuthState("auth")
+const { version } = await fetchLatestBaileysVersion()
+
+const sock = makeWASocket({
+version,
+auth: state,
+printQRInTerminal: false,
+browser: ["Ubuntu", "Chrome", "22.04.4"]
+})
+
+sock.ev.on("creds.update", saveCreds)
+
+// === QR ===
+sock.ev.on("connection.update", (update) => {
+const { connection, lastDisconnect, qr } = update
+
+if (qr) {
+console.log("📌 Scan QR ini untuk login:")
+qrcode.generate(qr, { small: true })
+}
+
+if (connection === "close") {
+const shouldReconnect =
+lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+console.log("❌ Koneksi putus. Reconnect:", shouldReconnect)
+if (shouldReconnect) startBot()
+} else if (connection === "open") {
+console.log("✅ Bot sudah terhubung ke WhatsApp")
+}
+})
+
+// === Pesan Masuk ===
+sock.ev.on("messages.upsert", async ({ messages }) => {
+const m = messages[0]
+if (!m.message || !m.key.remoteJid) return
+
+const from = m.key.remoteJid
+const sender = m.key.participant || m.key.remoteJid
+const text =
+m.message.conversation ||
+m.message.extendedTextMessage?.text ||
+""
+
+if (!text) return
+console.log("📩 Pesan diterima:", text)
+
+const lower = text.toLowerCase()
+
+// Trigger tambahan
+const isVoiceCmd =
+(lower.includes("suara") ||
+lower.includes("bersuara") ||
+lower.includes("suaranya")) &&
+lower.includes("moli")
+
+const isSingCmd =
+(lower.includes("nyanyi") ||
+lower.includes("bernyanyi") ||
+lower.includes("nyanyikan")) &&
+lower.includes("moli")
+
+const isTextCmd =
+lower.includes("moli") &&
+!isVoiceCmd &&
+!isSingCmd
+
+// ====== Perintah ======
+if (isTextCmd) {
+// Jawab text biasa
+await sock.sendMessage(from, {
+text: `@${sender.split("@")[0]} 🤔🙄...!`,
+mentions: [sender],
+quoted: m
+})
+
+const prompt = text.replace(/moli/gi, "").trim() || "Halo!"
+const result = await model.generateContent(prompt)
+const replyText = result.response.text()
+
+await sock.sendMessage(from, {
+text: `@${sender.split("@")[0]} \n${replyText}`,
+mentions: [sender],
+quoted: m
+})
+}
+
+else if (isVoiceCmd) {
+// Jawab suara
+await sock.sendMessage(from, {
+text: `@${sender.split("@")[0]} baik. dengarin suara aku yaaa 😎😎...!`,
+mentions: [sender],
+quoted: m
+})
+
+const prompt = text.replace(/moli/gi, "").trim()
+const result = await model.generateContent(prompt)
+const voiceText = result.response.text()
+
+const audioPath = await textToSpeech(voiceText)
+const audioBuffer = fs.readFileSync(audioPath)
+
+await sock.sendMessage(from, {
+audio: audioBuffer,
+mimetype: "audio/mp4",
+ptt: true,
+mentions: [sender],
+quoted: m
+})
+}
+
+else if (isSingCmd) {
+// Jawab nyanyi
+await sock.sendMessage(from, {
+text: `@${sender.split("@")[0]} Tunggu sebentar ya, aku cuma bisa bacain liriknya aja 🤣😋 ...!`,
+mentions: [sender],
+quoted: m
+})
+
+const prompt = text.replace(/moli/gi, "").trim()
+const result = await model.generateContent(prompt)
+const singText = result.response.text()
+
+const audioPath = await textToSpeech("🎵 " + singText)
+const audioBuffer = fs.readFileSync(audioPath)
+
+await sock.sendMessage(from, {
+audio: audioBuffer,
+mimetype: "audio/mp4",
+ptt: true,
+mentions: [sender],
+quoted: m
+})
+}
+})
+}
+
+startBot()

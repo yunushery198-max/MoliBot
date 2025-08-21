@@ -1,0 +1,104 @@
+// bot.cjs
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason
+} = require("@whiskeysockets/baileys");
+const fs = require("fs");
+const path = require("path");
+
+const ADMIN = "628xxx@s.whatsapp.net"; // ganti dengan nomor admin
+const COMMANDS_DIR = path.join(__dirname, "commands");
+let commands = {}; // daftar command aktif
+
+// 🔄 Load semua command .cjs
+function loadCommands() {
+  commands = {};
+  const files = fs.readdirSync(COMMANDS_DIR).filter(f => f.endsWith(".cjs"));
+  for (const file of files) {
+    const filePath = path.join(COMMANDS_DIR, file);
+    try {
+      delete require.cache[require.resolve(filePath)];
+      const cmd = require(filePath);
+      if (cmd && cmd.name && typeof cmd.execute === "function") {
+        commands[cmd.name] = cmd;
+        console.log(`✅ Loaded: ${file}`);
+      } else {
+        console.log(`⚠️ File ${file} tidak valid`);
+      }
+    } catch (err) {
+      console.log(`❌ Error load ${file}:`, err.message);
+    }
+  }
+}
+
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState("auth");
+  const sock = makeWASocket({ auth: state });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  // Load pertama kali
+  loadCommands();
+
+  // 🔥 Event pesan masuk
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const m = messages[0];
+    if (!m.message || !m.key.remoteJid) return;
+    const from = m.key.remoteJid;
+    const msg = m.message.conversation || m.message.extendedTextMessage?.text || "";
+
+    if (!msg.startsWith(".")) return;
+    const [cmd, ...args] = msg.slice(1).split(" ");
+    const text = args.join(" ");
+
+    try {
+      if (cmd === "rehash") {
+        loadCommands();
+        await sock.sendMessage(from, { text: "🔄 Commands direfresh!" });
+      }
+
+      else if (cmd === "addfile") {
+        // Format: .addfile nama-file -> kode
+        const [filenamePart, ...codeParts] = text.split("->");
+        if (!filenamePart || !codeParts.length) {
+          await sock.sendMessage(from, { text: "❌ Format salah.\nGunakan: .addfile nama-file -> code" });
+          return;
+        }
+        const filename = filenamePart.trim().replace(/\.cjs$/, "") + ".cjs";
+        const code = codeParts.join("->").trim();
+        const filePath = path.join(COMMANDS_DIR, filename);
+
+        try {
+          fs.writeFileSync(filePath, code, "utf8");
+          loadCommands(); // reload setelah add
+          await sock.sendMessage(from, { text: `✅ File ${filename} ditambahkan & direload.` });
+        } catch (err) {
+          await sock.sendMessage(ADMIN, { text: `❌ Gagal addfile ${filename}\nError: ${err.message}` });
+        }
+      }
+
+      else if (commands[cmd]) {
+        await commands[cmd].execute(sock, m, args);
+      }
+
+      else {
+        await sock.sendMessage(from, { text: "🤖 Command tidak dikenali." });
+      }
+    } catch (err) {
+      await sock.sendMessage(ADMIN, { text: `❌ Runtime error di command .${cmd}\n${err.message}` });
+    }
+  });
+
+  // Handle disconnect
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update;
+    if (connection === "close") {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log("connection closed. Reconnect:", shouldReconnect);
+      if (shouldReconnect) startBot();
+    }
+  });
+}
+
+startBot();
